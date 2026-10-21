@@ -48,6 +48,7 @@ Arduino-ESP32 3.3.12; do not install a separate library that also defines
 - Hold the button for 2 seconds to remove the pairing for the selected slot.
   Pair that slot again from the host's Bluetooth settings.
 - Button debounce is 30 ms. A long press does not also trigger a short press.
+- If the button is held while the board powers on, it is ignored until released.
 - USB keyboard reports are forwarded as BLE HID keyboard reports. Keystrokes
   are not written to the serial log.
 - USB keyboard unplug sends an all-keys-released report to the connected host;

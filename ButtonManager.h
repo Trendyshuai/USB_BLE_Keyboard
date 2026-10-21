@@ -20,6 +20,7 @@ private:
     bool _lastReading = HIGH;
     bool _stableState = HIGH;
     bool _longTriggered = false;
+    bool _ignorePressUntilRelease = false;
 
     // 使用 millis() 记录电平变化和按下时间，避免阻塞等待。
     uint32_t _lastChangeMs = 0;

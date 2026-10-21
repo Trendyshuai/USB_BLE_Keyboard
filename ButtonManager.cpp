@@ -9,6 +9,7 @@ void ButtonManager::begin() {
     _lastChangeMs = millis();
     _pressedAtMs = (_stableState == LOW) ? _lastChangeMs : 0;
     _longTriggered = false;
+    _ignorePressUntilRelease = (_stableState == LOW);
 }
 
 // 以稳定电平过滤抖动；长按在按住期间触发，短按在释放时触发。
@@ -30,16 +31,19 @@ ButtonEvent ButtonManager::update() {
             // 按下时开始计时，并允许本次按压触发长按事件。
             _pressedAtMs = now;
             _longTriggered = false;
+            _ignorePressUntilRelease = false;
         } else {
             // 仅未触发长按的按压，才在释放时报告为短按。
-            if (!_longTriggered) {
+            if (!_longTriggered && !_ignorePressUntilRelease) {
                 return BUTTON_SHORT_PRESS;
             }
+            _ignorePressUntilRelease = false;
         }
     }
 
     // 按住达到阈值时立即报告长按，且同一次按压不重复报告。
     if (_stableState == LOW &&
+        !_ignorePressUntilRelease &&
         !_longTriggered &&
         (uint32_t)(now - _pressedAtMs) >= BUTTON_LONG_PRESS_MS) {
         _longTriggered = true;
