@@ -10,6 +10,9 @@
 namespace {
 BLEManager* activeManager = nullptr;
 Preferences preferences;
+constexpr uint32_t DISCONNECT_RETRY_MS = 1000;
+constexpr uint32_t CONFIGURATION_RETRY_MS = 1000;
+constexpr uint8_t MAX_DISCONNECT_ATTEMPTS = 3;
 
 // BLE HID 键盘描述符：8 个修饰键位、保留字节和 6 个普通键位。
 uint8_t keyboardReportMap[] = {
@@ -106,6 +109,13 @@ bool BLEManager::begin() {
             _peerAddressTypes[slot] = preferences.getUChar(typeKey, BLE_ADDR_PUBLIC);
         }
     }
+    const uint8_t savedSlot = preferences.getUChar("slot", 0);
+    if (savedSlot < DEVICE_SLOT_COUNT) {
+        _activeSlot = savedSlot;
+    } else {
+        Serial.println("[BLE] Saved slot is invalid; using slot 1");
+    }
+    _pendingSlot = _activeSlot;
     preferences.end();
 
     if (!NimBLEDevice::init(BLE_DEVICE_NAMES[_activeSlot])) {
@@ -132,17 +142,40 @@ bool BLEManager::begin() {
     _hid->setReportMap(keyboardReportMap, sizeof(keyboardReportMap));
     _server->start();
     _inputReport = _hid->getInputReport(1);
+    if (_inputReport == nullptr) {
+        Serial.println("[BLE] Failed to create HID input report");
+        return false;
+    }
 
-    applySlotConfiguration();
+    if (!applySlotConfiguration()) {
+        _configurationRetryPending = true;
+        _lastConfigurationAttemptMs = millis();
+        return false;
+    }
     Serial.println("[BLE] HID keyboard ready");
+    _hidReadyLogged = true;
     return true;
 }
 
 void BLEManager::update() {
     // BLE 回调仅记录事件；存储、断开和重配广播统一在主循环中执行。
+    bool saveAddress = false;
+    char address[sizeof(_pendingAddress)] = {};
+    uint8_t addressType = 0;
+    uint8_t addressSlot = 0;
+    bool rejectConnection = false;
+    uint16_t rejectedHandle = 0;
+    bool connected = false;
+    bool disconnectRequestPending = false;
+    uint8_t disconnectAttempts = 0;
+
+    portENTER_CRITICAL(&_stateMux);
     if (_addressPending && _pendingPeerBonded) {
+        memcpy(address, _pendingAddress, sizeof(address));
+        addressType = _pendingAddressType;
+        addressSlot = _pendingAddressSlot;
+        saveAddress = true;
         _addressPending = false;
-        savePeer(_pendingAddressSlot, _pendingAddress, _pendingAddressType);
         _pendingPeerBonded = false;
     } else if (_addressPending && !_connected) {
         _addressPending = false;
@@ -151,31 +184,89 @@ void BLEManager::update() {
 
     if (_rejectConnectionPending) {
         _rejectConnectionPending = false;
-        if (_server != nullptr) {
-            _server->disconnect(_connectionHandle);
-        }
+        rejectConnection = true;
+        rejectedHandle = _rejectConnectionHandle;
     }
 
-    if (_disconnectPending) {
-        _disconnectPending = false;
-        if (_clearPending) {
-            processPendingClear();
-        }
-        _slotChangePending = true;
+    connected = _connected;
+    disconnectRequestPending = _disconnectRequestPending;
+    disconnectAttempts = _disconnectAttempts;
+    portEXIT_CRITICAL(&_stateMux);
+
+    if (saveAddress) {
+        savePeer(addressSlot, address, addressType);
     }
 
-    if (_clearPending && !_connected) {
+    if (rejectConnection && _server != nullptr) {
+        _server->disconnect(rejectedHandle);
+    }
+
+    if (_clearPending && !connected) {
         processPendingClear();
     }
 
-    if (_slotChangePending && !_connected) {
+    if (_slotChangePending && !connected) {
+        portENTER_CRITICAL(&_stateMux);
+        _activeSlot = _pendingSlot;
+        const uint8_t slotToSave = _activeSlot;
+        portEXIT_CRITICAL(&_stateMux);
+        _slotPersistencePending = !persistActiveSlot(slotToSave);
+        _lastSlotPersistenceAttemptMs = millis();
+
         _slotChangePending = false;
-        applySlotConfiguration();
+        if (applySlotConfiguration()) {
+            _configurationRetryPending = false;
+        } else {
+            _configurationRetryPending = true;
+            _lastConfigurationAttemptMs = millis();
+        }
+    } else if ((_slotChangePending || _clearPending) && connected &&
+               disconnectRequestPending &&
+               (uint32_t)(millis() - _lastDisconnectRequestMs) >=
+                   DISCONNECT_RETRY_MS) {
+        if (disconnectAttempts >= MAX_DISCONNECT_ATTEMPTS) {
+            portENTER_CRITICAL(&_stateMux);
+            _disconnectRequestPending = false;
+            _disconnectAttempts = 0;
+            portEXIT_CRITICAL(&_stateMux);
+            _slotChangePending = false;
+            _clearPending = false;
+            Serial.println("[BLE] Disconnect timed out; pending operation cancelled");
+        } else if (!requestDisconnect()) {
+            Serial.println("[BLE] Disconnect request failed; will retry");
+        }
+    }
+
+    if (_configurationRetryPending && !connected &&
+        (uint32_t)(millis() - _lastConfigurationAttemptMs) >=
+            CONFIGURATION_RETRY_MS) {
+        if (applySlotConfiguration()) {
+            _configurationRetryPending = false;
+            if (!_hidReadyLogged) {
+                Serial.println("[BLE] HID keyboard ready");
+                _hidReadyLogged = true;
+            }
+        } else {
+            _lastConfigurationAttemptMs = millis();
+        }
+    }
+
+    if (_slotPersistencePending &&
+        (uint32_t)(millis() - _lastSlotPersistenceAttemptMs) >=
+            CONFIGURATION_RETRY_MS) {
+        if (persistActiveSlot(activeSlot())) {
+            _slotPersistencePending = false;
+        } else {
+            _lastSlotPersistenceAttemptMs = millis();
+        }
     }
 }
 
 void BLEManager::sendKeyboardReport(const KeyboardReport& report) {
-    if (!_connected || _inputReport == nullptr) {
+    portENTER_CRITICAL(&_stateMux);
+    const bool connected = _connected;
+    portEXIT_CRITICAL(&_stateMux);
+    if (!connected || _inputReport == nullptr) {
         return;
     }
 
@@ -194,28 +285,45 @@ void BLEManager::sendKeyboardReport(const KeyboardReport& report) {
     _inputReport->notify();
 }
 
-void BLEManager::setActiveSlot(uint8_t slot) {
-    if (slot >= DEVICE_SLOT_COUNT || slot == _activeSlot) {
-        return;
+bool BLEManager::setActiveSlot(uint8_t slot) {
+    if (slot >= DEVICE_SLOT_COUNT) {
+        return false;
     }
 
-    // 切换槽位需要断开现有主机后才能修改设备名称和广播过滤规则。
-    _activeSlot = slot;
+    portENTER_CRITICAL(&_stateMux);
+    if (slot == _activeSlot && !_slotChangePending) {
+        portEXIT_CRITICAL(&_stateMux);
+        return true;
+    }
+    const bool connected = _connected;
+    _pendingSlot = slot;
+    if (!connected) {
+        _activeSlot = slot;
+    }
+    portEXIT_CRITICAL(&_stateMux);
+
+    // 连接状态下先保留当前槽位，收到断开确认后再切换并持久化。
     _slotChangePending = true;
-    if (_connected && _server != nullptr) {
-        if (!_server->disconnect(_connectionHandle)) {
-            Serial.println("[BLE] Failed to request host disconnect");
+    if (connected) {
+        if (!requestDisconnect()) {
+            Serial.println("[BLE] Disconnect request failed; will retry");
         }
     } else {
         update();
     }
+    return true;
 }
 
 void BLEManager::clearActivePairing() {
+    portENTER_CRITICAL(&_stateMux);
+    const bool connected = _connected;
+    _clearSlot = _activeSlot;
+    portEXIT_CRITICAL(&_stateMux);
+
     _clearPending = true;
-    if (_connected && _server != nullptr) {
-        if (!_server->disconnect(_connectionHandle)) {
-            Serial.println("[BLE] Failed to disconnect before clearing pairing");
+    if (connected) {
+        if (!requestDisconnect()) {
+            Serial.println("[BLE] Disconnect request failed; will retry");
         }
     } else {
         update();
@@ -223,11 +331,17 @@ void BLEManager::clearActivePairing() {
 }
 
 uint8_t BLEManager::activeSlot() const {
-    return _activeSlot;
+    portENTER_CRITICAL(&_stateMux);
+    const uint8_t slot = _activeSlot;
+    portEXIT_CRITICAL(&_stateMux);
+    return slot;
 }
 
 bool BLEManager::isConnected() const {
-    return _connected;
+    portENTER_CRITICAL(&_stateMux);
+    const bool connected = _connected;
+    portEXIT_CRITICAL(&_stateMux);
+    return connected;
 }
 
 void BLEManager::handleConnect(
@@ -236,29 +350,44 @@ void BLEManager::handleConnect(
     uint16_t handle
 ) {
     // 已配对设备只能连接其所属槽位；拒绝连接到其他槽位的已知主机。
+    char savedAddresses[DEVICE_SLOT_COUNT][18];
+    uint8_t savedAddressTypes[DEVICE_SLOT_COUNT];
+    uint8_t selectedSlot;
+    portENTER_CRITICAL(&_stateMux);
+    memcpy(savedAddresses, _peerAddresses, sizeof(savedAddresses));
+    memcpy(savedAddressTypes, _peerAddressTypes, sizeof(savedAddressTypes));
+    selectedSlot = _activeSlot;
+    portEXIT_CRITICAL(&_stateMux);
+
+    int8_t matchedSlot = -1;
     for (uint8_t slot = 0; slot < DEVICE_SLOT_COUNT; ++slot) {
-        if (_peerAddresses[slot][0] == '\0') {
+        if (savedAddresses[slot][0] == '\0') {
             continue;
         }
 
         const NimBLEAddress savedAddress(
-            std::string(_peerAddresses[slot]),
-            _peerAddressTypes[slot]
+            std::string(savedAddresses[slot]),
+            savedAddressTypes[slot]
         );
         const NimBLEAddress incomingAddress(std::string(address), addressType);
         if (savedAddress == incomingAddress) {
-            if (slot == _activeSlot) {
-                break;
-            }
-            _connectionHandle = handle;
-            _rejectConnectionPending = true;
-            return;
+            matchedSlot = static_cast<int8_t>(slot);
+            break;
         }
     }
 
-    _connectionHandle = handle;
-    _connectionSlot = _activeSlot;
-    _connected = true;
+    portENTER_CRITICAL(&_stateMux);
+    if ((_connected && _connectionHandle != handle) ||
+        selectedSlot != _activeSlot ||
+        (matchedSlot >= 0 && matchedSlot != _activeSlot)) {
+        _rejectConnectionHandle = handle;
+        _rejectConnectionPending = true;
+    } else {
+        _connectionHandle = handle;
+        _connectionSlot = _activeSlot;
+        _connected = true;
+    }
+    portEXIT_CRITICAL(&_stateMux);
 }
 
 void BLEManager::handleAuthenticatedPeer(
@@ -267,45 +396,89 @@ void BLEManager::handleAuthenticatedPeer(
     bool bonded
 ) {
     // 只保存已建立连接且完成绑定的主机，避免记录未配对设备。
-    if (!bonded || !_connected) {
+    if (!bonded) {
         return;
     }
 
+    portENTER_CRITICAL(&_stateMux);
+    if (!_connected) {
+        portEXIT_CRITICAL(&_stateMux);
+        return;
+    }
     strncpy(_pendingAddress, address, sizeof(_pendingAddress) - 1);
     _pendingAddress[sizeof(_pendingAddress) - 1] = '\0';
     _pendingAddressType = addressType;
     _pendingAddressSlot = _connectionSlot;
     _pendingPeerBonded = true;
     _addressPending = true;
+    portEXIT_CRITICAL(&_stateMux);
 }
 
 void BLEManager::handleDisconnect() {
+    portENTER_CRITICAL(&_stateMux);
     _connected = false;
-    _disconnectPending = true;
+    _disconnectRequestPending = false;
+    _disconnectAttempts = 0;
+    portEXIT_CRITICAL(&_stateMux);
 }
 
-void BLEManager::applySlotConfiguration() {
-    if (_server == nullptr || _connected) {
-        return;
+bool BLEManager::requestDisconnect() {
+    uint16_t handle;
+    portENTER_CRITICAL(&_stateMux);
+    if (!_connected) {
+        portEXIT_CRITICAL(&_stateMux);
+        return true;
+    }
+    handle = _connectionHandle;
+    _disconnectRequestPending = true;
+    if (_disconnectAttempts == 0) {
+        _disconnectAttempts = 1;
+    } else if (_disconnectAttempts < MAX_DISCONNECT_ATTEMPTS) {
+        ++_disconnectAttempts;
+    }
+    _lastDisconnectRequestMs = millis();
+    portEXIT_CRITICAL(&_stateMux);
+
+    if (_server != nullptr && _server->disconnect(handle)) {
+        return true;
+    }
+
+    return false;
+}
+
+bool BLEManager::applySlotConfiguration() {
+    char peerAddress[18];
+    uint8_t peerAddressType;
+    uint8_t slot;
+    bool connected;
+    portENTER_CRITICAL(&_stateMux);
+    slot = _activeSlot;
+    connected = _connected;
+    memcpy(peerAddress, _peerAddresses[slot], sizeof(peerAddress));
+    peerAddressType = _peerAddressTypes[slot];
+    portEXIT_CRITICAL(&_stateMux);
+
+    if (_server == nullptr || connected) {
+        return false;
     }
 
     // 重建广播配置，确保设备名称、HID 服务和当前槽位过滤规则一致。
     NimBLEAdvertising* advertising = NimBLEDevice::getAdvertising();
     if (!advertising->reset()) {
         Serial.println("[BLE] Failed to reset advertising configuration");
-        return;
+        return false;
     }
 
-    const char* deviceName = BLE_DEVICE_NAMES[_activeSlot];
+    const char* deviceName = BLE_DEVICE_NAMES[slot];
     if (!NimBLEDevice::setDeviceName(deviceName) ||
         !advertising->setAppearance(HID_KEYBOARD) ||
         !advertising->addServiceUUID("1812") ||
         !advertising->setName(deviceName)) {
         Serial.printf(
             "[BLE] Failed to configure advertising for slot %u\n",
-            static_cast<unsigned>(_activeSlot + 1)
+            static_cast<unsigned>(slot + 1)
         );
-        return;
+        return false;
     }
 
     // 先清空上一个槽位留下的白名单，再按当前槽位重新添加配对主机。
@@ -315,19 +488,19 @@ void BLEManager::applySlotConfiguration() {
                 NimBLEDevice::getWhiteListAddress(lastIndex)
             )) {
             Serial.println("[BLE] Failed to reset controller whitelist");
-            return;
+            return false;
         }
     }
 
-    const bool hasPeer = _peerAddresses[_activeSlot][0] != '\0';
+    const bool hasPeer = peerAddress[0] != '\0';
     if (hasPeer) {
         const NimBLEAddress address(
-            std::string(_peerAddresses[_activeSlot]),
-            _peerAddressTypes[_activeSlot]
+            std::string(peerAddress),
+            peerAddressType
         );
         if (!NimBLEDevice::whiteListAdd(address)) {
             Serial.println("[BLE] Failed to whitelist selected paired host");
-            return;
+            return false;
         }
     }
 
@@ -335,18 +508,22 @@ void BLEManager::applySlotConfiguration() {
     advertising->setScanFilter(false, hasPeer);
     if (!advertising->start()) {
         Serial.println("[BLE] Failed to start advertising");
-        return;
+        return false;
     }
 
     Serial.printf(
         "[BLE] Advertising for slot %u (%s)\n",
-        static_cast<unsigned>(_activeSlot + 1),
+        static_cast<unsigned>(slot + 1),
         hasPeer ? "paired host only" : "pairing available"
     );
+    return true;
 }
 
 void BLEManager::processPendingClear() {
-    forgetActivePeer();
+    if (!forgetPeer(_clearSlot)) {
+        Serial.printf("[BLE] Pairing clear failed for slot %u\n",
+                      static_cast<unsigned>(_clearSlot + 1));
+    }
     _clearPending = false;
     _slotChangePending = true;
 }
@@ -356,11 +533,10 @@ void BLEManager::savePeer(uint8_t slot, const char* address, uint8_t addressType
         return;
     }
 
-    strncpy(_peerAddresses[slot], address, sizeof(_peerAddresses[slot]) - 1);
-    _peerAddresses[slot][sizeof(_peerAddresses[slot]) - 1] = '\0';
-    _peerAddressTypes[slot] = addressType;
+    char savedAddress[sizeof(_peerAddresses[slot])];
+    strncpy(savedAddress, address, sizeof(savedAddress) - 1);
+    savedAddress[sizeof(savedAddress) - 1] = '\0';
 
-    // 内存状态用于当前运行；Preferences 保存信息供下次启动恢复。
     if (!preferences.begin(BLE_PREFERENCES_NAMESPACE, false)) {
         Serial.println("[BLE] Failed to persist paired host");
         return;
@@ -371,51 +547,114 @@ void BLEManager::savePeer(uint8_t slot, const char* address, uint8_t addressType
     snprintf(addressKey, sizeof(addressKey), "peer%u", slot);
     snprintf(typeKey, sizeof(typeKey), "type%u", slot);
     const size_t savedAddressLength =
-        preferences.putString(addressKey, _peerAddresses[slot]);
+        preferences.putString(addressKey, savedAddress);
     const size_t savedAddressType =
         preferences.putUChar(typeKey, addressType);
     preferences.end();
     if (savedAddressLength == 0 || savedAddressType == 0) {
         Serial.println("[BLE] Failed to persist complete pairing data");
+        return;
     }
+
+    portENTER_CRITICAL(&_stateMux);
+    memcpy(_peerAddresses[slot], savedAddress, sizeof(savedAddress));
+    _peerAddressTypes[slot] = addressType;
+    portEXIT_CRITICAL(&_stateMux);
 }
 
-void BLEManager::forgetActivePeer() {
-    // 同时删除 NimBLE 绑定和持久化槽位记录，避免旧主机仍可重连。
-    const bool hadPeer = _peerAddresses[_activeSlot][0] != '\0';
-    if (hadPeer) {
-        const NimBLEAddress address(
-            std::string(_peerAddresses[_activeSlot]),
-            _peerAddressTypes[_activeSlot]
-        );
-        if (!NimBLEDevice::deleteBond(address)) {
-            Serial.println("[BLE] Could not remove the selected host bond");
-        }
+bool BLEManager::persistActiveSlot(uint8_t slot) {
+    if (slot >= DEVICE_SLOT_COUNT) {
+        return false;
     }
 
-    _peerAddresses[_activeSlot][0] = '\0';
-    _peerAddressTypes[_activeSlot] = BLE_ADDR_PUBLIC;
+    if (!preferences.begin(BLE_PREFERENCES_NAMESPACE, false)) {
+        Serial.println("[BLE] Failed to open storage for selected slot");
+        return false;
+    }
+    const size_t saved = preferences.putUChar("slot", slot);
+    preferences.end();
+    if (saved == 0) {
+        Serial.println("[BLE] Failed to persist selected slot");
+        return false;
+    }
+    return true;
+}
+
+bool BLEManager::forgetPeer(uint8_t slot) {
+    if (slot >= DEVICE_SLOT_COUNT) {
+        return false;
+    }
+
+    char peerAddress[sizeof(_peerAddresses[slot])];
+    uint8_t peerAddressType;
+    portENTER_CRITICAL(&_stateMux);
+    memcpy(peerAddress, _peerAddresses[slot], sizeof(peerAddress));
+    peerAddressType = _peerAddressTypes[slot];
+    portEXIT_CRITICAL(&_stateMux);
 
     if (!preferences.begin(BLE_PREFERENCES_NAMESPACE, false)) {
         Serial.println("[BLE] Failed to update pairing storage");
-        return;
+        return false;
     }
 
     char addressKey[8];
     char typeKey[8];
-    snprintf(addressKey, sizeof(addressKey), "peer%u", _activeSlot);
-    snprintf(typeKey, sizeof(typeKey), "type%u", _activeSlot);
-    bool removedAddress = true;
-    bool removedType = true;
-    if (hadPeer) {
-        removedAddress = preferences.remove(addressKey);
-        removedType = preferences.remove(typeKey);
-    }
+    snprintf(addressKey, sizeof(addressKey), "peer%u", slot);
+    snprintf(typeKey, sizeof(typeKey), "type%u", slot);
+    const bool removedAddress =
+        !preferences.isKey(addressKey) || preferences.remove(addressKey);
+    const bool removedType =
+        !preferences.isKey(typeKey) || preferences.remove(typeKey);
     preferences.end();
     if (!removedAddress || !removedType) {
         Serial.println("[BLE] Failed to remove pairing data from storage");
+        if (peerAddress[0] != '\0' &&
+            !restorePairingRecord(slot, peerAddress, peerAddressType)) {
+            Serial.println("[BLE] Failed to restore pairing data after storage error");
+        }
+        return false;
     }
 
+    if (peerAddress[0] != '\0') {
+        const NimBLEAddress address(
+            std::string(peerAddress),
+            peerAddressType
+        );
+        if (!NimBLEDevice::deleteBond(address)) {
+            Serial.println("[BLE] Could not remove the selected host bond");
+            if (!restorePairingRecord(slot, peerAddress, peerAddressType)) {
+                Serial.println("[BLE] Failed to restore pairing data after bond error");
+            }
+            return false;
+        }
+    }
+
+    portENTER_CRITICAL(&_stateMux);
+    _peerAddresses[slot][0] = '\0';
+    _peerAddressTypes[slot] = BLE_ADDR_PUBLIC;
+    portEXIT_CRITICAL(&_stateMux);
+
     Serial.printf("[BLE] Pairing cleared for slot %u\n",
-                  static_cast<unsigned>(_activeSlot + 1));
+                  static_cast<unsigned>(slot + 1));
+    return true;
+}
+
+bool BLEManager::restorePairingRecord(
+    uint8_t slot,
+    const char* address,
+    uint8_t addressType
+) {
+    if (slot >= DEVICE_SLOT_COUNT ||
+        !preferences.begin(BLE_PREFERENCES_NAMESPACE, false)) {
+        return false;
+    }
+
+    char addressKey[8];
+    char typeKey[8];
+    snprintf(addressKey, sizeof(addressKey), "peer%u", slot);
+    snprintf(typeKey, sizeof(typeKey), "type%u", slot);
+    const size_t savedAddress = preferences.putString(addressKey, address);
+    const size_t savedType = preferences.putUChar(typeKey, addressType);
+    preferences.end();
+    return savedAddress > 0 && savedType > 0;
 }

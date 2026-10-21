@@ -23,21 +23,28 @@ void setup() {
     buttonManager.begin();
     ledManager.begin();
 
-    if (!usbManager.begin()) {
+    const bool usbReady = usbManager.begin();
+    if (!usbReady) {
         Serial.println("[ERROR] USB Host initialization failed");
     }
 
-    if (!bleManager.begin()) {
+    const bool bleReady = bleManager.begin();
+    if (!bleReady) {
         Serial.println("[ERROR] BLE HID initialization failed");
     }
 
-    Serial.println("[READY] Insert a USB keyboard");
-    Serial.println("[READY] Short press: next Bluetooth host slot");
-    Serial.println("[READY] Long press: clear pairing for the selected slot");
+    if (usbReady) {
+        Serial.println("[READY] Insert a USB keyboard");
+    }
+    if (bleReady) {
+        Serial.println("[READY] Short press: next Bluetooth host slot");
+        Serial.println("[READY] Long press: clear pairing for the selected slot");
+    }
 }
 
 // 每轮先处理 USB 主机事件，再转发键盘报告并处理 BLE、按键和 LED 状态。
 void loop() {
+    static bool wasConnected = false;
     usbManager.task();
 
     KeyboardReport report;
@@ -47,14 +54,25 @@ void loop() {
 
     bleManager.update();
 
+    // 连接建立后补发当前键盘状态，覆盖 BLE 断开期间发生的按键变化。
+    const bool connected = bleManager.isConnected();
+    if (connected && !wasConnected) {
+        usbManager.currentReport(report);
+        bleManager.sendKeyboardReport(report);
+    }
+    wasConnected = connected;
+
     const ButtonEvent event = buttonManager.update();
 
     if (event == BUTTON_SHORT_PRESS) {
         const uint8_t nextSlot =
             (bleManager.activeSlot() + 1) % DEVICE_SLOT_COUNT;
-        bleManager.setActiveSlot(nextSlot);
-        Serial.printf("[BUTTON] Selected slot %u\n",
-                      static_cast<unsigned>(nextSlot + 1));
+        if (bleManager.setActiveSlot(nextSlot)) {
+            Serial.printf("[BUTTON] Switching to slot %u\n",
+                          static_cast<unsigned>(nextSlot + 1));
+        } else {
+            Serial.println("[BUTTON] Slot switch failed");
+        }
     } else if (event == BUTTON_LONG_PRESS) {
         bleManager.clearActivePairing();
     }

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Arduino.h>
+#include <freertos/FreeRTOS.h>
 #include "Config.h"
 #include "USBManager.h"
 
@@ -17,7 +18,7 @@ public:
     // 将 USB 键盘报告编码为 BLE HID 输入报告并通知主机。
     void sendKeyboardReport(const KeyboardReport& report);
     // 切换广播槽位；若当前已连接，先请求断开连接。
-    void setActiveSlot(uint8_t slot);
+    bool setActiveSlot(uint8_t slot);
     // 清除当前槽位的配对信息，连接中则先请求断开。
     void clearActivePairing();
 
@@ -41,11 +42,18 @@ private:
     );
     void handleDisconnect();
     // 根据当前槽位的配对状态重建广播和控制器白名单。
-    void applySlotConfiguration();
+    bool applySlotConfiguration();
+    bool persistActiveSlot(uint8_t slot);
+    bool requestDisconnect();
     void processPendingClear();
     // 保存认证成功的主机地址及其地址类型。
     void savePeer(uint8_t slot, const char* address, uint8_t addressType);
-    void forgetActivePeer();
+    bool forgetPeer(uint8_t slot);
+    bool restorePairingRecord(
+        uint8_t slot,
+        const char* address,
+        uint8_t addressType
+    );
 
     NimBLEServer* _server = nullptr;
     NimBLEHIDDevice* _hid = nullptr;
@@ -54,19 +62,30 @@ private:
     // 每个槽位保存一个已配对主机的地址及地址类型。
     char _peerAddresses[DEVICE_SLOT_COUNT][18] = {};
     uint8_t _peerAddressTypes[DEVICE_SLOT_COUNT] = {};
+    // 临界区保护回调任务与 Arduino 主循环共享的 BLE 状态。
+    mutable portMUX_TYPE _stateMux = portMUX_INITIALIZER_UNLOCKED;
     char _pendingAddress[18] = {};
     uint8_t _pendingAddressType = 0;
     uint8_t _pendingAddressSlot = 0;
     // 记录连接建立时的槽位，保证配对数据写入正确槽位。
     uint8_t _connectionSlot = 0;
-    // 回调与主循环共享的状态使用 volatile 标记，跨任务传递待处理事件。
-    volatile bool _pendingPeerBonded = false;
     uint8_t _activeSlot = 0;
-    volatile uint16_t _connectionHandle = 0;
-    volatile bool _connected = false;
-    volatile bool _rejectConnectionPending = false;
-    volatile bool _addressPending = false;
-    volatile bool _disconnectPending = false;
+    uint8_t _pendingSlot = 0;
+    uint8_t _clearSlot = 0;
+    uint16_t _connectionHandle = 0;
+    uint16_t _rejectConnectionHandle = 0;
+    bool _pendingPeerBonded = false;
+    bool _connected = false;
+    bool _rejectConnectionPending = false;
+    bool _addressPending = false;
+    bool _disconnectRequestPending = false;
     bool _slotChangePending = false;
     bool _clearPending = false;
+    bool _configurationRetryPending = false;
+    bool _slotPersistencePending = false;
+    bool _hidReadyLogged = false;
+    uint8_t _disconnectAttempts = 0;
+    uint32_t _lastDisconnectRequestMs = 0;
+    uint32_t _lastConfigurationAttemptMs = 0;
+    uint32_t _lastSlotPersistenceAttemptMs = 0;
 };

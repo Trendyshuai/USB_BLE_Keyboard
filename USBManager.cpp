@@ -18,25 +18,36 @@ bool USBManager::Keyboard::claim(
         return false;
     }
 
+    portENTER_CRITICAL(&_stateMux);
     _devAddr = devAddr;
     _interfaceIndex = interfaceIndex;
     _mounted = true;
+    portEXIT_CRITICAL(&_stateMux);
     return true;
 }
 
 // 仅处理当前实例认领的接口；卸载标记由主机任务循环消费。
 void USBManager::Keyboard::onUnmount(uint8_t devAddr, uint8_t interfaceIndex) {
-    if (_mounted && devAddr == _devAddr && interfaceIndex == _interfaceIndex) {
-        USBHostHIDKeyboard::onUnmount(devAddr, interfaceIndex);
+    portENTER_CRITICAL(&_stateMux);
+    const bool matches =
+        _mounted && devAddr == _devAddr && interfaceIndex == _interfaceIndex;
+    if (matches) {
         _mounted = false;
         _unmounted = true;
+    }
+    portEXIT_CRITICAL(&_stateMux);
+
+    if (matches) {
+        USBHostHIDKeyboard::onUnmount(devAddr, interfaceIndex);
     }
 }
 
 // 消费一次卸载通知，避免同一拔出事件被重复处理。
 bool USBManager::Keyboard::consumeUnmount() {
+    portENTER_CRITICAL(&_stateMux);
     const bool unmounted = _unmounted;
     _unmounted = false;
+    portEXIT_CRITICAL(&_stateMux);
     return unmounted;
 }
 
@@ -74,6 +85,7 @@ bool USBManager::readReport(KeyboardReport& report) {
             key = 0;
         }
         _releasePending = false;
+        _currentReport = report;
         return true;
     }
 
@@ -81,8 +93,13 @@ bool USBManager::readReport(KeyboardReport& report) {
         report.modifiers = _keyboard.getModifiers();
         _keyboard.getKeys(report.keys);
         _keyboard.clear();
+        _currentReport = report;
         return true;
     }
 
     return false;
+}
+
+void USBManager::currentReport(KeyboardReport& report) const {
+    report = _currentReport;
 }

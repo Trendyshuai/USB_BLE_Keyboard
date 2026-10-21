@@ -44,6 +44,7 @@ Arduino-ESP32 3.3.12; do not install a separate library that also defines
 - Short press advances through the three host slots and restarts advertising
   with that slot's Bluetooth name. A slot with a saved host remains discoverable
   but only accepts that host; an empty slot accepts a new pairing.
+- The selected slot is saved in non-volatile storage and restored after reboot.
 - Hold the button for 2 seconds to remove the pairing for the selected slot.
   Pair that slot again from the host's Bluetooth settings.
 - Button debounce is 30 ms. A long press does not also trigger a short press.

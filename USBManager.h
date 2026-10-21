@@ -1,5 +1,6 @@
 #pragma once
 #include <Arduino.h>
+#include <freertos/FreeRTOS.h>
 #include <USBHostHIDKeyboard.h>
 
 struct KeyboardReport {
@@ -17,6 +18,8 @@ public:
 
     // 有新报告或待发送的全释放报告时返回 true。
     bool readReport(KeyboardReport& report);
+    // 复制最近一次键盘状态；从未收到报告时返回全释放状态。
+    void currentReport(KeyboardReport& report) const;
 
 private:
     class Keyboard final : public USBHostHIDKeyboard {
@@ -31,14 +34,16 @@ private:
 
     private:
         // 用设备地址和接口号识别本实例所管理的键盘。
+        portMUX_TYPE _stateMux = portMUX_INITIALIZER_UNLOCKED;
         uint8_t _devAddr = 0;
         uint8_t _interfaceIndex = 0;
         bool _mounted = false;
-        volatile bool _unmounted = false;
+        bool _unmounted = false;
     };
 
     Keyboard _keyboard;
     bool _started = false;
     // 拔出键盘后先发送全释放报告，避免主机保留卡住的按键状态。
     bool _releasePending = false;
+    KeyboardReport _currentReport = {};
 };
