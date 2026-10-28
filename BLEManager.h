@@ -49,11 +49,6 @@ private:
     // 保存认证成功的主机地址及其地址类型。
     void savePeer(uint8_t slot, const char* address, uint8_t addressType);
     bool forgetPeer(uint8_t slot);
-    bool restorePairingRecord(
-        uint8_t slot,
-        const char* address,
-        uint8_t addressType
-    );
 
     NimBLEServer* _server = nullptr;
     NimBLEHIDDevice* _hid = nullptr;
@@ -76,6 +71,7 @@ private:
     uint16_t _rejectConnectionHandle = 0;
     bool _pendingPeerBonded = false;
     bool _connected = false;
+    bool _advertisingRestartPending = false;
     bool _rejectConnectionPending = false;
     bool _addressPending = false;
     bool _disconnectRequestPending = false;
